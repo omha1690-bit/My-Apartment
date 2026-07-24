@@ -906,7 +906,7 @@ const Utils = {
     if (!iso) return '—';
     const d = new Date(iso);
     if (isNaN(d)) return iso;
-    return d.toLocaleDateString('ar-EG', { year: 'numeric', month: 'short', day: 'numeric' });
+    return d.toLocaleDateString('ar-EG', { day: 'numeric', month: 'numeric' });
   },
   daysBetween(dateA, dateB = new Date()) {
     const a = new Date(dateA);
@@ -1327,6 +1327,7 @@ async function mountApartments() {
 
   const state = { search: '', status: 'all' };
   let apartments = [];
+  let tenants = [];
   let settings = null;
 
   const STATUS_LABELS = { available: 'متاحة', rented: 'مؤجرة', maintenance: 'صيانة' };
@@ -1396,14 +1397,92 @@ async function mountApartments() {
         <td data-label="الحالة"><span class="badge badge--${a.status}">${STATUS_LABELS[a.status]}</span></td>
         <td data-label="">
           <div class="row-actions">
+            <button class="btn btn--icon" data-view-apt="${a.id}" title="عرض الحجوزات">${Icon('eye', { size: 16 })}</button>
             <button class="btn btn--icon" data-edit="${a.id}" title="تعديل">${Icon('edit', { size: 16 })}</button>
             <button class="btn btn--icon" data-del="${a.id}" title="حذف">${Icon('trash', { size: 16 })}</button>
           </div>
         </td>
       </tr>`).join('');
 
+    Utils.qsa('[data-view-apt]').forEach((btn) => btn.addEventListener('click', () => viewApartment(btn.dataset.viewApt)));
     Utils.qsa('[data-edit]').forEach((btn) => btn.addEventListener('click', () => openApartmentForm(btn.dataset.edit)));
     Utils.qsa('[data-del]').forEach((btn) => btn.addEventListener('click', () => deleteApartment(btn.dataset.del)));
+  }
+
+  /** Returns each booking sorted by start date, plus the free gaps between/around them (today onward). */
+  function getApartmentSchedule(apartmentId, tenantsList) {
+    const bookings = tenantsList
+      .filter((t) => t.apartmentId === apartmentId)
+      .slice()
+      .sort((x, y) => new Date(x.contractStart) - new Date(y.contractStart));
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const free = [];
+    let cursor = null;
+    bookings.forEach((b) => {
+      const start = new Date(b.contractStart);
+      const end = new Date(b.contractEnd);
+      if (cursor === null) {
+        if (start > today) free.push({ start: today, end: start });
+      } else if (start > cursor) {
+        free.push({ start: cursor, end: start });
+      }
+      if (cursor === null || end > cursor) cursor = end;
+    });
+    free.push({ start: cursor && cursor > today ? cursor : today, end: null });
+
+    return { bookings, free };
+  }
+
+  function viewApartment(id) {
+    const a = apartments.find((x) => x.id === id);
+    if (!a) return;
+    const { bookings, free } = getApartmentSchedule(id, tenants);
+
+    const bookingsHtml = bookings.length
+      ? bookings.map((t) => `
+          <div class="flex items-center justify-between" style="padding:10px 0;border-bottom:1px solid var(--border,#eee);">
+            <div>
+              <div class="cell-strong">${Utils.escapeHtml(t.fullName)}</div>
+              <div class="text-muted text-sm">${Utils.formatDate(t.contractStart)} إلى ${Utils.formatDate(t.contractEnd)}</div>
+            </div>
+            <span class="badge badge--rented">محجوزة</span>
+          </div>`).join('')
+      : `<p class="text-muted text-sm">لا يوجد حجوزات مسجلة على هذه الشقة</p>`;
+
+    const freeHtml = free.length
+      ? free.map((f) => `
+          <div class="flex items-center justify-between" style="padding:10px 0;border-bottom:1px solid var(--border,#eee);">
+            <div class="text-sm">${Utils.formatDate(f.start.toISOString().slice(0, 10))} إلى ${f.end ? Utils.formatDate(f.end.toISOString().slice(0, 10)) : 'غير محدد'}</div>
+            <span class="badge badge--available">فاضية</span>
+          </div>`).join('')
+      : '';
+
+    const overlay = openSheet(`
+      <div class="sheet__header">
+        <div class="sheet__grabber-zone"><span class="sheet__grabber"></span></div>
+        <div class="sheet__titlebar">
+          <h3>${Utils.escapeHtml(a.name)} — الحجوزات والفترات الفاضية</h3>
+          <button class="btn btn--icon" data-close-modal>${Icon('x', { size: 18 })}</button>
+        </div>
+      </div>
+      <div class="modal__body">
+        <h4 class="mt-0">الفترات الفاضية</h4>
+        ${freeHtml || '<p class="text-muted text-sm">لا يوجد فترات فاضية قادمة</p>'}
+        <h4>الحجوزات</h4>
+        ${bookingsHtml}
+      </div>
+      <div class="modal__footer">
+        <button class="btn btn--ghost" data-close-modal>إغلاق</button>
+        <button class="btn btn--primary" id="addBookingBtn">حجز جديد</button>
+      </div>
+    `);
+    overlay.querySelector('#addBookingBtn').addEventListener('click', () => {
+      closeModal(overlay);
+      window.location.hash = `#/tenants?newFor=${id}`;
+    });
   }
 
   async function deleteApartment(id) {
@@ -1539,6 +1618,7 @@ async function mountApartments() {
 
   async function reload() {
     apartments = await DB.apartments.getAll();
+    tenants = await DB.tenants.getAll();
     settings = await DB.settings.get();
     renderTable();
   }
@@ -1696,12 +1776,13 @@ async function mountTenants(params) {
     await reload();
   }
 
-  function openTenantForm(id) {
+  function openTenantForm(id, presetApartmentId) {
     const editing = id ? tenants.find((t) => t.id === id) : null;
     let idImage = editing?.idImage || '';
     let contractFile = editing?.contractFile || '';
 
     const availableApts = apartments.filter((a) => a.status !== 'maintenance' || a.id === editing?.apartmentId);
+    const selectedAptId = editing?.apartmentId || presetApartmentId || '';
 
     const overlay = openSheet(`
       <div class="sheet__header">
@@ -1723,7 +1804,7 @@ async function mountTenants(params) {
               <label>الشقة المستأجرة *</label>
               <select name="apartmentId" required>
                 <option value="">اختر الشقة...</option>
-                ${availableApts.map((a) => `<option value="${a.id}" ${editing?.apartmentId === a.id ? 'selected' : ''}>${Utils.escapeHtml(a.name)} (${Utils.escapeHtml(a.code)})</option>`).join('')}
+                ${availableApts.map((a) => `<option value="${a.id}" ${selectedAptId === a.id ? 'selected' : ''}>${Utils.escapeHtml(a.name)} (${Utils.escapeHtml(a.code)})</option>`).join('')}
               </select>
               <span class="hint">يمكن حجز نفس الشقة لأكثر من مستأجر في فترات مختلفة، وسيتم التنبيه تلقائيًا عند تداخل التواريخ</span>
             </div>
@@ -1855,6 +1936,7 @@ async function mountTenants(params) {
   await reload();
 
   if (params.get('id')) viewTenant(params.get('id'));
+  if (params.get('newFor')) openTenantForm(null, params.get('newFor'));
 }
 
 async function mountPayments(params) {
